@@ -43,7 +43,9 @@
 typedef struct {
 
 	DWORD	size;				/* sizeof(bbs_struct_t) */
-    DWORD   interface_addr;
+	struct in_addr outgoing4;
+	struct in6_addr	outgoing6;
+	str_list_t		interfaces;
     DWORD	options;			/* See BBS_OPT definitions */
 	WORD	sem_chk_freq;			/* semaphore file checking frequency (in seconds) */
 
@@ -92,7 +94,8 @@ typedef struct {
 #if 0
 /* startup options that requires re-initialization/recycle when changed */
 static struct init_field services_init_fields[] = { 
-	 OFFSET_AND_SIZE(services_startup_t,interface_addr)
+	 OFFSET_AND_SIZE(services_startup_t,outgoing4)
+	 OFFSET_AND_SIZE(services_startup_t,outgoing6)
 	,OFFSET_AND_SIZE(services_startup_t,ctrl_dir)
 	,{ 0,0 }	/* terminator */
 };

@@ -65,6 +65,7 @@
 #include "sbbs.h"
 #include "sbbsdefs.h"
 #include "sockwrap.h"		/* sendfilesocket() */
+#include "multisock.h"
 #include "threadwrap.h"
 #include "semwrap.h"
 #include "websrvr.h"
@@ -106,8 +107,9 @@ static protected_uint32_t active_clients;
 static protected_uint32_t thread_count;
 static volatile ulong	sockets=0;
 static volatile BOOL	terminate_server=FALSE;
+static volatile BOOL	terminated=FALSE;
 static volatile BOOL	terminate_http_logging_thread=FALSE;
-static SOCKET	server_socket=INVALID_SOCKET;
+static struct xpms_set	*ws_set=NULL;
 static char		revision[16];
 static char		root_dir[MAX_PATH+1];
 static char		error_dir[MAX_PATH+1];
@@ -236,11 +238,10 @@ typedef struct  {
 
 typedef struct  {
 	SOCKET			socket;
-	SOCKADDR_IN		addr;
-	SOCKET			socket6;
-	SOCKADDR_IN		addr6;
+	union xp_sockaddr	addr;
+	socklen_t		addr_len;
 	http_request_t	req;
-	char			host_ip[64];
+	char			host_ip[INET6_ADDRSTRLEN];
 	char			host_name[128];	/* Resolved remote host */
 	int				http_ver;       /* HTTP version.  0 = HTTP/0.9, 1=HTTP/1.0, 2=HTTP/1.1 */
 	BOOL			finished;		/* Do not accept any more imput from client */
@@ -801,21 +802,29 @@ static time_t decode_date(char *date)
 	return(t);
 }
 
-static SOCKET open_socket(int type)
+static void open_socket(SOCKET sock, void *cbdata)
 {
 	char	error[256];
-	SOCKET	sock;
+#ifdef SO_ACCEPTFILTER
+	struct accept_filter_arg afa;
+#endif
 
-	sock=socket(AF_INET, type, IPPROTO_IP);
-	if(sock!=INVALID_SOCKET && startup!=NULL && startup->socket_open!=NULL) 
-		startup->socket_open(startup->cbdata,TRUE);
-	if(sock!=INVALID_SOCKET) {
-		if(set_socket_options(&scfg, sock, "web|http", error, sizeof(error)))
-			lprintf(LOG_ERR,"%04d !ERROR %s",sock,error);
+	startup->socket_open(startup->cbdata,TRUE);
+	if(set_socket_options(&scfg, sock, "web|http", error, sizeof(error)))
+		lprintf(LOG_ERR,"%04d !ERROR %s",sock,error);
+#ifdef SO_ACCEPTFILTER
+	memset(&afa, 0, sizeof(afa));
+	strcpy(afa.af_name, "httpready");
+	setsockopt(sock, SOL_SOCKET, SO_ACCEPTFILTER, &afa, sizeof(afa));
+#endif
 
-		sockets++;
-	}
-	return(sock);
+	sockets++;
+}
+
+static void close_socket_cb(SOCKET sock, void *cbdata)
+{
+	startup->socket_open(startup->cbdata,FALSE);
+	sockets--;
 }
 
 static int close_socket(SOCKET *sock)
@@ -2862,6 +2871,43 @@ static BOOL check_extra_path(http_session_t * session)
 	return(FALSE);
 }
 
+static void read_webctrl_section(FILE *file, char *section, http_session_t *session, BOOL *recheck_dynamic)
+{
+	char	str[MAX_PATH+1];
+
+	if(iniReadString(file, section, "AccessRequirements", session->req.ars,str)==str)
+		SAFECOPY(session->req.ars,str);
+	if(iniReadString(file, section, "Realm", scfg.sys_name,str)==str) {
+		FREE_AND_NULL(session->req.realm);
+		/* FREE()d in close_request() */
+		session->req.realm=strdup(str);
+	}
+	if(iniReadString(file, section, "DigestRealm", scfg.sys_name,str)==str) {
+		FREE_AND_NULL(session->req.digest_realm);
+		/* FREE()d in close_request() */
+		session->req.digest_realm=strdup(str);
+	}
+	if(iniReadString(file, section, "ErrorDirectory", error_dir,str)==str) {
+		prep_dir(root_dir, str, sizeof(str));
+		FREE_AND_NULL(session->req.error_dir);
+		/* FREE()d in close_request() */
+		session->req.error_dir=strdup(str);
+	}
+	if(iniReadString(file, section, "CGIDirectory", cgi_dir,str)==str) {
+		prep_dir(root_dir, str, sizeof(str));
+		FREE_AND_NULL(session->req.cgi_dir);
+		/* FREE()d in close_request() */
+		session->req.cgi_dir=strdup(str);
+		*recheck_dynamic=TRUE;
+	}
+	if(iniReadString(file, section, "Authentication", default_auth_list,str)==str) {
+		FREE_AND_NULL(session->req.auth_list);
+		/* FREE()d in close_request() */
+		session->req.auth_list=strdup(str);
+	}
+	session->req.path_info_index=iniReadBool(file, section, "PathInfoIndex", FALSE);
+}
+
 static BOOL check_request(http_session_t * session)
 {
 	char	path[MAX_PATH+1];
@@ -2878,6 +2924,8 @@ static BOOL check_request(http_session_t * session)
 	char	*spec;
 	str_list_t	specs;
 	BOOL	recheck_dynamic=FALSE;
+	char	*spath, *sp, *nsp, *pspec;
+	size_t	len;
 
 	if(session->req.finished)
 		return(FALSE);
@@ -2986,71 +3034,28 @@ static BOOL check_request(http_session_t * session)
 				/* FREE()d in this block */
 				specs=iniReadSectionList(file,NULL);
 				/* Read in globals */
-				if(iniReadString(file, NULL, "AccessRequirements", session->req.ars,str)==str)
-					SAFECOPY(session->req.ars,str);
-				if(iniReadString(file, NULL, "Realm", scfg.sys_name,str)==str) {
-					FREE_AND_NULL(session->req.realm);
-					/* FREE()d in close_request() */
-					session->req.realm=strdup(str);
-				}
-				if(iniReadString(file, NULL, "DigestRealm", scfg.sys_name,str)==str) {
-					FREE_AND_NULL(session->req.digest_realm);
-					/* FREE()d in close_request() */
-					session->req.digest_realm=strdup(str);
-				}
-				if(iniReadString(file, NULL, "ErrorDirectory", error_dir,str)==str) {
-					prep_dir(root_dir, str, sizeof(str));
-					FREE_AND_NULL(session->req.error_dir);
-					/* FREE()d in close_request() */
-					session->req.error_dir=strdup(str);
-				}
-				if(iniReadString(file, NULL, "CGIDirectory", cgi_dir,str)==str) {
-					prep_dir(root_dir, str, sizeof(str));
-					FREE_AND_NULL(session->req.cgi_dir);
-					/* FREE()d in close_request() */
-					session->req.cgi_dir=strdup(str);
-					recheck_dynamic=TRUE;
-				}
-				if(iniReadString(file, NULL, "Authentication", default_auth_list,str)==str) {
-					FREE_AND_NULL(session->req.auth_list);
-					/* FREE()d in close_request() */
-					session->req.auth_list=strdup(str);
-				}
-				session->req.path_info_index=iniReadBool(file, NULL, "PathInfoIndex", FALSE);
+				read_webctrl_section(file, NULL, session, &recheck_dynamic);
 				/* Read in per-filespec */
 				while((spec=strListPop(&specs))!=NULL) {
-					if(wildmatch(filename,spec,TRUE)) {
-						if(iniReadString(file, spec, "AccessRequirements", session->req.ars,str)==str)
-							SAFECOPY(session->req.ars,str);
-						if(iniReadString(file, spec, "Realm", scfg.sys_name,str)==str) {
-							FREE_AND_NULL(session->req.realm);
-							/* FREE()d in close_request() */
-							session->req.realm=strdup(str);
+					len=strlen(spec);
+					if(spec[0] && IS_PATH_DELIM(spec[len-1])) {
+						/* Search for matching path elements... */
+						spath=strdup(path+(p-curdir+1));
+						pspec=strdup(spec);
+						pspec[len-1]=0;
+						for(sp=spath, nsp=find_first_slash(sp+1); nsp; nsp=find_first_slash(sp+1)) {
+							*nsp=0;
+							nsp++;
+							if(wildmatch(sp, pspec, TRUE)) {
+								read_webctrl_section(file, spec, session, &recheck_dynamic);
+							}
+							sp=nsp;
 						}
-						if(iniReadString(file, spec, "DigestRealm", scfg.sys_name,str)==str) {
-							FREE_AND_NULL(session->req.digest_realm);
-							/* FREE()d in close_request() */
-							session->req.digest_realm=strdup(str);
-						}
-						if(iniReadString(file, spec, "ErrorDirectory", error_dir,str)==str) {
-							FREE_AND_NULL(session->req.error_dir);
-							prep_dir(root_dir, str, sizeof(str));
-							/* FREE()d in close_request() */
-							session->req.error_dir=strdup(str);
-						}
-						if(iniReadString(file, spec, "CGIDirectory", cgi_dir,str)==str) {
-							FREE_AND_NULL(session->req.cgi_dir);
-							prep_dir(root_dir, str, sizeof(str));
-							/* FREE()d in close_request() */
-							session->req.cgi_dir=strdup(str);
-							recheck_dynamic=TRUE;
-						}
-						if(iniReadString(file, spec, "Authentication", default_auth_list,str)==str) {
-							FREE_AND_NULL(session->req.auth_list);
-							/* FREE()d in close_request() */
-							session->req.auth_list=strdup(str);
-						}
-						session->req.path_info_index=iniReadBool(file, spec, "PathInfoIndex", FALSE);
+						free(spath);
+						free(pspec);
+					}
+					else if(wildmatch(filename,spec,TRUE)) {
+						read_webctrl_section(file, spec, session, &recheck_dynamic);
 					}
 					free(spec);
 				}
@@ -3656,7 +3661,7 @@ static BOOL exec_cgi(http_session_t *session)
 
 	SAFECOPY(cgi_status,session->req.status);
 	SAFEPRINTF2(content_type,"%s: %s",get_header(HEAD_TYPE),startup->default_cgi_content);
-	while(server_socket!=INVALID_SOCKET) {
+	while(!terminated) {
 
 		if(WaitForSingleObject(process_info.hProcess,0)==WAIT_OBJECT_0)
 			process_terminated=TRUE;	/* handle remaining data in pipe before breaking */
@@ -5047,8 +5052,6 @@ void http_output_thread(void *arg)
 
 void http_session_thread(void* arg)
 {
-	char*			host_name;
-	HOSTENT*		host;
 	SOCKET			socket;
 	char			redir_req[MAX_REQUEST_LINE+1];
 	char			*redirp;
@@ -5100,18 +5103,8 @@ void http_session_thread(void* arg)
 
 	sbbs_srand();	/* Seed random number generator */
 
-	if(startup->options&BBS_OPT_NO_HOST_LOOKUP)
-		host=NULL;
-	else
-		host=gethostbyaddr ((char *)&session.addr.sin_addr
-			,sizeof(session.addr.sin_addr),AF_INET);
-
-	if(host!=NULL && host->h_name!=NULL)
-		host_name=host->h_name;
-	else
-		host_name=session.host_ip;
-
-	SAFECOPY(session.host_name,host_name);
+	if(getnameinfo(&session.addr.addr, session.addr_len, session.host_name, sizeof(session.host_name), NULL, 0, (startup->options&BBS_OPT_NO_HOST_LOOKUP)?NI_NUMERICHOST:0)!=0)
+		SAFECOPY(session.host_name, session.host_ip);
 
 	if(!(startup->options&BBS_OPT_NO_HOST_LOOKUP))  {
 		lprintf(LOG_INFO,"%04d Hostname: %s", session.socket, session.host_name);
@@ -5149,7 +5142,7 @@ void http_session_thread(void* arg)
 
 	SAFECOPY(session.client.addr,session.host_ip);
 	SAFECOPY(session.client.host,session.host_name);
-	session.client.port=ntohs(session.addr.sin_port);
+	session.client.port=inet_addrport(&session.addr);
 	session.client.time=time32(NULL);
 	session.client.protocol="HTTP";
 	session.client.user=session.username;
@@ -5278,7 +5271,7 @@ void http_session_thread(void* arg)
 
 void DLLCALL web_terminate(void)
 {
-   	lprintf(LOG_INFO,"%04d Web Server terminate",server_socket);
+   	lprintf(LOG_INFO,"Web Server terminate");
 	terminate_server=TRUE;
 }
 
@@ -5304,8 +5297,10 @@ static void cleanup(int code)
 	semfile_list_free(&recycle_semfiles);
 	semfile_list_free(&shutdown_semfiles);
 
-	if(server_socket!=INVALID_SOCKET) {
-		close_socket(&server_socket);
+	if(!terminated) {
+		xpms_destroy(ws_set, close_socket_cb, NULL);
+		ws_set=NULL;
+		terminated=TRUE;
 	}
 
 	update_clients();	/* active_clients is destroyed below */
@@ -5370,7 +5365,7 @@ void http_logging_thread(void* arg)
 
 	thread_up(TRUE /* setuid */);
 
-	lprintf(LOG_INFO,"%04d HTTP logging thread started", server_socket);
+	lprintf(LOG_INFO,"HTTP logging thread started");
 
 	for(;;) {
 		struct log_data *ld;
@@ -5391,8 +5386,7 @@ void http_logging_thread(void* arg)
 		if(ld==NULL) {
 			if(terminate_http_logging_thread)
 				break;
-			lprintf(LOG_ERR,"%04d HTTP logging thread received NULL linked list log entry"
-				,server_socket);
+			lprintf(LOG_ERR,"HTTP logging thread received NULL linked list log entry");
 			continue;
 		}
 		SAFECOPY(newfilename,base);
@@ -5408,7 +5402,7 @@ void http_logging_thread(void* arg)
 			SAFECOPY(filename,newfilename);
 			logfile=fopen(filename,"ab");
 			if(logfile)
-				lprintf(LOG_INFO,"%04d HTTP logfile is now: %s",server_socket,filename);
+				lprintf(LOG_INFO,"HTTP logfile is now: %s",filename);
 		}
 		if(logfile!=NULL) {
 			if(ld->status) {
@@ -5435,7 +5429,7 @@ void http_logging_thread(void* arg)
 			}
 		}
 		else {
-			lprintf(LOG_ERR,"%04d HTTP server failed to open logfile %s (%d)!",server_socket,filename,errno);
+			lprintf(LOG_ERR,"HTTP server failed to open logfile %s (%d)!",filename,errno);
 		}
 		FREE_AND_NULL(ld->hostname);
 		FREE_AND_NULL(ld->ident);
@@ -5451,40 +5445,32 @@ void http_logging_thread(void* arg)
 		logfile=NULL;
 	}
 	thread_down();
-	lprintf(LOG_INFO,"%04d HTTP logging thread terminated",server_socket);
+	lprintf(LOG_INFO,"HTTP logging thread terminated");
 
 	http_logging_thread_running=FALSE;
 }
 
 void DLLCALL web_server(void* arg)
 {
-	int				i;
-	int				result;
 	time_t			start;
 	WORD			host_port;
-	char			host_ip[32];
+	char			host_ip[INET6_ADDRSTRLEN];
 	char			path[MAX_PATH+1];
 	char			logstr[256];
 	char			mime_types_ini[MAX_PATH+1];
 	char			web_handler_ini[MAX_PATH+1];
-	SOCKADDR_IN		server_addr={0};
-	SOCKADDR_IN		client_addr;
+	union xp_sockaddr	client_addr;
 	socklen_t		client_addr_len;
 	SOCKET			client_socket;
-	SOCKET			high_socket_set;
-	fd_set			socket_set;
 	time_t			t;
 	time_t			initialized=0;
 	FILE*			fp;
 	char*			p;
 	char			compiler[32];
 	http_session_t *	session=NULL;
-	struct timeval tv;
+	struct in_addr	iaddr;
 #ifdef ONE_JS_RUNTIME
 	JSRuntime*      js_runtime;
-#endif
-#ifdef SO_ACCEPTFILTER
-	struct accept_filter_arg afa;
 #endif
 
 	startup=(web_startup_t*)arg;
@@ -5531,7 +5517,8 @@ void DLLCALL web_server(void* arg)
 	js_server_props.version_detail=web_ver();
 	js_server_props.clients=&active_clients.value;
 	js_server_props.options=&startup->options;
-	js_server_props.interface_addr=&startup->interface_addr;
+	/* TODO IPv6 */
+	js_server_props.interface_addr=&startup->outgoing4;
 
 	uptime=0;
 	served=0;
@@ -5645,65 +5632,19 @@ void DLLCALL web_server(void* arg)
 		update_clients();
 
 		/* open a socket and wait for a client */
-
-		server_socket = open_socket(SOCK_STREAM);
-
-		if(server_socket == INVALID_SOCKET) {
-			lprintf(LOG_CRIT,"!ERROR %d creating HTTP socket", ERROR_VALUE);
-			cleanup(1);
-			return;
-		}
+		ws_set = xpms_create(startup->bind_retry_count, startup->bind_retry_delay, lprintf);
 		
-/*
- *		i=1;
- *		if(setsockopt(server_socket, IPPROTO_TCP, TCP_NOPUSH, &i, sizeof(i)))
- *			lprintf("Cannot set TCP_NOPUSH socket option");
- */
-
-#ifdef SO_ACCEPTFILTER
-		memset(&afa, 0, sizeof(afa));
-		strcpy(afa.af_name, "httpready");
-		setsockopt(server_socket, SOL_SOCKET, SO_ACCEPTFILTER, &afa, sizeof(afa));
-#endif
-
-		lprintf(LOG_DEBUG,"%04d Web Server socket opened",server_socket);
-
-		/*****************************/
-		/* Listen for incoming calls */
-		/*****************************/
-		memset(&server_addr, 0, sizeof(server_addr));
-
-		server_addr.sin_addr.s_addr = htonl(startup->interface_addr);
-		server_addr.sin_family = AF_INET;
-		server_addr.sin_port   = htons(startup->port);
-
-		if(startup->port < IPPORT_RESERVED) {
-			if(startup->seteuid!=NULL)
-				startup->seteuid(FALSE);
-		}
-		result = retry_bind(server_socket,(struct sockaddr *)&server_addr,sizeof(server_addr)
-			,startup->bind_retry_count,startup->bind_retry_delay,"Web Server",lprintf);
-		if(startup->port < IPPORT_RESERVED) {
-			if(startup->seteuid!=NULL)
-				startup->seteuid(TRUE);
-		}
-		if(result != 0) {
-			lprintf(LOG_CRIT,"%s",BIND_FAILURE_HELP);
+		if(ws_set == NULL) {
+			lprintf(LOG_CRIT,"!ERROR %d creating HTTP socket set", ERROR_VALUE);
 			cleanup(1);
 			return;
 		}
+		lprintf(LOG_DEBUG,"Web Server socket set created");
 
-		result = listen(server_socket, 64);
-
-		if(result != 0) {
-			lprintf(LOG_CRIT,"%04d !ERROR %d (%d) listening on socket"
-				,server_socket, result, ERROR_VALUE);
-			cleanup(1);
-			return;
-		}
-		lprintf(LOG_INFO,"%04d Web Server listening on port %u"
-			,server_socket, startup->port);
-		status("Listening");
+		/*
+		 * Add interfaces
+		 */
+		xpms_add_list(ws_set, PF_UNSPEC, SOCK_STREAM, 0, startup->interfaces, startup->port, "Web Server", open_socket, startup->seteuid, NULL);
 
 		listInit(&log_list,/* flags */ LINK_LIST_MUTEX|LINK_LIST_SEMAPHORE);
 		if(startup->options&WEB_OPT_HTTP_LOGGING) {
@@ -5717,11 +5658,11 @@ void DLLCALL web_server(void* arg)
 
 #ifdef ONE_JS_RUNTIME
 	    if(js_runtime == NULL) {
-    	    lprintf(LOG_DEBUG,"%04d JavaScript: Creating runtime: %lu bytes"
-        	    ,server_socket,startup->js.max_bytes);
+    	    lprintf(LOG_DEBUG,"JavaScript: Creating runtime: %lu bytes"
+        	    ,startup->js.max_bytes);
 
     	    if((js_runtime=jsrt_GetNew(startup->js.max_bytes, 0, __FILE__, __LINE__))==NULL) {
-        	    lprintf(LOG_ERR,"%04d !ERROR creating JavaScript runtime",server_socket);
+        	    lprintf(LOG_ERR,"!ERROR creating JavaScript runtime");
 				/* Sleep 15 seconds then try again */
 				/* ToDo: Something better should be used here. */
 				SLEEP(15000);
@@ -5748,16 +5689,15 @@ void DLLCALL web_server(void* arg)
 		if(startup->started!=NULL)
     		startup->started(startup->cbdata);
 
-		lprintf(LOG_INFO,"%04d Web Server thread started", server_socket);
+		lprintf(LOG_INFO,"Web Server thread started");
 
-		while(server_socket!=INVALID_SOCKET && !terminate_server) {
+		while(!terminated && !terminate_server) {
 
 			/* check for re-cycle/shutdown semaphores */
 			if(protected_uint32_value(thread_count) <= (2 /* web_server() and http_output_thread() */ + http_logging_thread_running)) {
 				if(!(startup->options&BBS_OPT_NO_RECYCLE)) {
 					if((p=semfile_list_check(&initialized,recycle_semfiles))!=NULL) {
-						lprintf(LOG_INFO,"%04d Recycle semaphore file (%s) detected"
-							,server_socket,p);
+						lprintf(LOG_INFO,"Recycle semaphore file (%s) detected",p);
 						if(session!=NULL) {
 							pthread_mutex_unlock(&session->struct_filled);
 							session=NULL;
@@ -5765,7 +5705,7 @@ void DLLCALL web_server(void* arg)
 						break;
 					}
 					if(startup->recycle_now==TRUE) {
-						lprintf(LOG_INFO,"%04d Recycle semaphore signaled",server_socket);
+						lprintf(LOG_INFO,"Recycle semaphore signaled");
 						startup->recycle_now=FALSE;
 						if(session!=NULL) {
 							pthread_mutex_unlock(&session->struct_filled);
@@ -5775,11 +5715,9 @@ void DLLCALL web_server(void* arg)
 					}
 				}
 				if(((p=semfile_list_check(&initialized,shutdown_semfiles))!=NULL
-						&& lprintf(LOG_INFO,"%04d Shutdown semaphore file (%s) detected"
-							,server_socket,p))
+						&& lprintf(LOG_INFO,"Shutdown semaphore file (%s) detected",p))
 					|| (startup->shutdown_now==TRUE
-						&& lprintf(LOG_INFO,"%04d Shutdown semaphore signaled"
-							,server_socket))) {
+						&& lprintf(LOG_INFO,"Shutdown semaphore signaled"))) {
 					startup->shutdown_now=FALSE;
 					terminate_server=TRUE;
 					if(session!=NULL) {
@@ -5794,8 +5732,7 @@ void DLLCALL web_server(void* arg)
 			if(session==NULL) {
 				/* FREE()d at the start of the session thread */
 				if((session=malloc(sizeof(http_session_t)))==NULL) {
-					lprintf(LOG_CRIT,"%04d !ERROR allocating %u bytes of memory for http_session_t"
-						,server_socket, sizeof(http_session_t));
+					lprintf(LOG_CRIT,"!ERROR allocating %u bytes of memory for http_session_t", sizeof(http_session_t));
 					mswait(3000);
 					continue;
 				}
@@ -5809,60 +5746,22 @@ void DLLCALL web_server(void* arg)
 			}
 
 			/* now wait for connection */
+			client_addr_len = sizeof(client_addr);
+			client_socket = xpms_accept(ws_set, &client_addr, &client_addr_len, startup->sem_chk_freq*1000, NULL);
 
-			FD_ZERO(&socket_set);
-			FD_SET(server_socket,&socket_set);
-			high_socket_set=server_socket+1;
-
-			tv.tv_sec=startup->sem_chk_freq;
-			tv.tv_usec=0;
-
-			if((i=select(high_socket_set,&socket_set,NULL,NULL,&tv))<1) {
-				if(i==0)
-					continue;
-				if(ERROR_VALUE==EINTR)
-					lprintf(LOG_DEBUG,"Web Server listening interrupted");
-				else if(ERROR_VALUE == ENOTSOCK)
-            		lprintf(LOG_INFO,"Web Server socket closed");
-				else
-					lprintf(LOG_WARNING,"!ERROR %d selecting socket",ERROR_VALUE);
+			if(client_socket == INVALID_SOCKET)
 				continue;
-			}
 
-			if(server_socket==INVALID_SOCKET) {	/* terminated */
+			if(terminated) {	/* terminated */
 				pthread_mutex_unlock(&session->struct_filled);
 				session=NULL;
 				break;
 			}
 
-			client_addr_len = sizeof(client_addr);
-
-			if(server_socket!=INVALID_SOCKET
-				&& FD_ISSET(server_socket,&socket_set)) {
-				client_socket = accept(server_socket, (struct sockaddr *)&client_addr
-	        		,&client_addr_len);
-			}
-			else {
-				lprintf(LOG_NOTICE,"!NO SOCKETS set by select");
-				continue;
-			}
-
-			if(client_socket == INVALID_SOCKET)	{
-				lprintf(LOG_WARNING,"!ERROR %d accepting connection", ERROR_VALUE);
-#ifdef _WIN32
-				if(WSAGetLastError()==WSAENOBUFS) {	/* recycle (re-init WinSock) on this error */
-					pthread_mutex_unlock(&session->struct_filled);
-					session=NULL;
-					break;
-				}
-#endif
-				continue;
-			}
-
 			if(startup->socket_open!=NULL)
 				startup->socket_open(startup->cbdata,TRUE);
 
-			SAFECOPY(host_ip,inet_ntoa(client_addr.sin_addr));
+			inet_addrtop(&client_addr, host_ip, sizeof(host_ip));
 
 			if(trashcan(&scfg,host_ip,"ip-silent")) {
 				close_socket(&client_socket);
@@ -5877,14 +5776,15 @@ void DLLCALL web_server(void* arg)
 				continue;
 			}
 
-			host_port=ntohs(client_addr.sin_port);
+			host_port=inet_addrport(&client_addr);
 
 			lprintf(LOG_INFO,"%04d HTTP connection accepted from: %s port %u"
 				,client_socket
 				,host_ip, host_port);
 
 			SAFECOPY(session->host_ip,host_ip);
-			session->addr=client_addr;
+			memcpy(&session->addr, &client_addr, sizeof(session->addr));
+			session->addr_len=client_addr_len;
    			session->socket=client_socket;
 			session->js_callback.auto_terminate=TRUE;
 			session->js_callback.terminated=&terminate_server;
@@ -5907,13 +5807,13 @@ void DLLCALL web_server(void* arg)
 
 		/* Wait for active clients to terminate */
 		if(protected_uint32_value(active_clients)) {
-			lprintf(LOG_DEBUG,"%04d Waiting for %d active clients to disconnect..."
-				,server_socket, protected_uint32_value(active_clients));
+			lprintf(LOG_DEBUG,"Waiting for %d active clients to disconnect..."
+				, protected_uint32_value(active_clients));
 			start=time(NULL);
 			while(protected_uint32_value(active_clients)) {
 				if(time(NULL)-start>startup->max_inactivity) {
-					lprintf(LOG_WARNING,"%04d !TIMEOUT waiting for %d active clients"
-						,server_socket, protected_uint32_value(active_clients));
+					lprintf(LOG_WARNING,"!TIMEOUT waiting for %d active clients"
+						, protected_uint32_value(active_clients));
 					break;
 				}
 				mswait(100);
@@ -5926,13 +5826,12 @@ void DLLCALL web_server(void* arg)
 			mswait(100);
 		}
 		if(http_logging_thread_running) {
-			lprintf(LOG_DEBUG,"%04d Waiting for HTTP logging thread to terminate..."
-				,server_socket);
+			lprintf(LOG_DEBUG,"Waiting for HTTP logging thread to terminate...");
 			start=time(NULL);
 			while(http_logging_thread_running) {
 				if(time(NULL)-start>TIMEOUT_THREAD_WAIT) {
-					lprintf(LOG_WARNING,"%04d !TIMEOUT waiting for HTTP logging thread to "
-            			"terminate", server_socket);
+					lprintf(LOG_WARNING,"!TIMEOUT waiting for HTTP logging thread to "
+            			"terminate");
 					break;
 				}
 				mswait(100);
@@ -5941,7 +5840,7 @@ void DLLCALL web_server(void* arg)
 
 #ifdef ONE_JS_RUNTIME
     	if(js_runtime!=NULL) {
-        	lprintf(LOG_DEBUG,"%04d JavaScript: Destroying runtime",server_socket);
+        	lprintf(LOG_DEBUG,"JavaScript: Destroying runtime");
         	jsrt_Release(js_runtime);
     	    js_runtime=NULL;
 	    }

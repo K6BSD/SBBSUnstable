@@ -43,14 +43,16 @@
 #include "semwrap.h"			/* sem_t */
 
 typedef struct {
-	DWORD	size;				/* sizeof(web_startup_t) */
-	WORD	port;
-	WORD	max_clients;
-	WORD	max_inactivity;
-	WORD	max_cgi_inactivity;
-	WORD	sem_chk_freq;		/* semaphore file checking frequency (in seconds) */
-    DWORD   interface_addr;
-    DWORD	options;
+	DWORD		size;				/* sizeof(web_startup_t) */
+	WORD		max_clients;
+	WORD		max_inactivity;
+	WORD		max_cgi_inactivity;
+	WORD		sem_chk_freq;		/* semaphore file checking frequency (in seconds) */
+    DWORD		options;
+	WORD		port;
+	struct in_addr outgoing4;
+	struct in6_addr	outgoing6;
+    str_list_t	interfaces;
 	
 	void*	cbdata;				/* Private data passed to callbacks */ 
 
@@ -111,7 +113,9 @@ typedef struct {
 /* startup options that requires re-initialization/recycle when changed */
 static struct init_field web_init_fields[] = { 
 	 OFFSET_AND_SIZE(web_startup_t,port)
-	,OFFSET_AND_SIZE(web_startup_t,interface_addr)
+	,OFFSET_AND_SIZE(web_startup_t,interfaces)
+	,OFFSET_AND_SIZE(web_startup_t,outgoing4)
+	,OFFSET_AND_SIZE(web_startup_t,outgoing6)
 	,OFFSET_AND_SIZE(web_startup_t,ctrl_dir)
 	,OFFSET_AND_SIZE(web_startup_t,root_dir)
 	,OFFSET_AND_SIZE(web_startup_t,error_dir)
