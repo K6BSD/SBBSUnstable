@@ -1,0 +1,5 @@
+rswindell=Rob Swindell <rob@synchro.net>
+deuce=Stephen Hurd <shurd@sasktel.net>
+cyan=Randy Sommerfeld <sysop@rrx.ca>
+mcmlxxix=Matt Johnson <mcmlxxix@thebrokenbubble.com>
+echicken=Derek Mullin <echicken@electronicchicken.com>

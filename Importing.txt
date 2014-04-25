@@ -1,0 +1,6 @@
+git cvsimport -d :pserver:deuce@cvs.synchro.net:/cvsroot/sbbs -C tmp/src/build -r cvs -k -A /synchronet/SBBSUnstable/Authors.txt src/build -v
+git remote add -f src_build_project tmp/src/build
+git merge -s ours --no-commit src_build_project/master 
+git read-tree --prefix=default_config/web/root/ -u src_build_project/master
+git commit -m "Merge src/build as our subdirectory"
+
