@@ -37,6 +37,7 @@
 
 #include "sbbs.h"
 #include "telnet.h"
+#include <cryptlib.h>
 
 extern "C" void client_on(SOCKET sock, client_t* client, BOOL update);
 

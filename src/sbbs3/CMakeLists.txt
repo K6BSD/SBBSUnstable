@@ -52,7 +52,7 @@ endif()
 
 if(NOT WIN32)
 	add_custom_target(3rdp
-		${3RDP_GNU_MAKE} cryptlib libmozjs DONT_CLOBBER_CC=please  ${BUILD_TYPE_FLAG}
+		${3RDP_GNU_MAKE} cryptlib jslib DONT_CLOBBER_CC=please  ${BUILD_TYPE_FLAG}
 		WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../../3rdp/build
 	)
 endif()
