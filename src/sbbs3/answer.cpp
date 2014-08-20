@@ -2,7 +2,7 @@
 
 /* Synchronet answer "caller" function */
 
-/* $Id$ */
+/* $Id: answer.cpp,v 1.82 2014/03/08 07:42:35 rswindell Exp $ */
 
 /****************************************************************************
  * @format.tab-size 4		(Plain Text/Source Code File Header)			*
@@ -37,7 +37,6 @@
 
 #include "sbbs.h"
 #include "telnet.h"
-#include <cryptlib.h>
 
 extern "C" void client_on(SOCKET sock, client_t* client, BOOL update);
 

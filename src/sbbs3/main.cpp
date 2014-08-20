@@ -2,7 +2,7 @@
 
 /* Synchronet terminal server thread and related functions */
 
-/* $Id$ */
+/* $Id: main.cpp,v 1.607 2014/05/01 08:12:27 rswindell Exp $ */
 
 /****************************************************************************
  * @format.tab-size 4		(Plain Text/Source Code File Header)			*
@@ -2041,7 +2041,7 @@ void output_thread(void* arg)
 	char		node[128];
 	char		stats[128];
     BYTE		buf[IO_THREAD_BUF_SIZE];
-	int			i;
+	int			i=0;	// Assignment to silence Valgrind
     ulong		avail;
 	ulong		total_sent=0;
 	ulong		total_pkts=0;
@@ -3003,6 +3003,7 @@ sbbs_t::sbbs_t(ushort node_num, union xp_sockaddr *addr, size_t addr_len, const 
 
 #ifdef USE_CRYPTLIB
 	ssh_mode=false;
+	ssh_mutex_created=false;
     passthru_input_thread_running = false;
     passthru_output_thread_running = false;
 #endif
@@ -3392,7 +3393,10 @@ bool sbbs_t::init()
 			} 
 	}
 
+#ifdef USE_CRYPTLIB
 	pthread_mutex_init(&ssh_mutex,NULL);
+	ssh_mutex_created = true;
+#endif
 	pthread_mutex_init(&input_thread_mutex,NULL);
 
 	reset_logon_vars();
@@ -3520,8 +3524,10 @@ sbbs_t::~sbbs_t()
 	FREE_AND_NULL(batdn_cdt);
 	FREE_AND_NULL(batdn_alt);
 
-	while(pthread_mutex_destroy(&ssh_mutex)==EBUSY)
+#ifdef USE_CRYPTLIB
+	while(ssh_mutex_created && pthread_mutex_destroy(&ssh_mutex)==EBUSY)
 		mswait(1);
+#endif
 	while(pthread_mutex_destroy(&input_thread_mutex)==EBUSY)
 		mswait(1);
 
@@ -4462,7 +4468,7 @@ void DLLCALL bbs_thread(void* arg)
 	BOOL			is_client=FALSE;
 #ifdef __unix__
 	SOCKET	uspy_listen_socket[MAX_NODES];
-	struct main_sock_cb_data	uspy_cb[MAX_NODES];
+	struct main_sock_cb_data	uspy_cb[MAX_NODES]={};
 	union xp_sockaddr uspy_addr;
 #endif
 #ifdef USE_CRYPTLIB
